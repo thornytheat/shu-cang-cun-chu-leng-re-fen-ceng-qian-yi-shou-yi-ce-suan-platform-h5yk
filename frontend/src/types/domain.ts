@@ -215,6 +215,19 @@ export interface TrialResult {
   computed_at: string
 }
 
+export interface PlanItemPrevious {
+  size_gb: number | null
+  hot_score: number | null
+  save_month: number | null
+  migration_cost: number | null
+  payback_months: number | null
+  net_save_year: number | null
+  risk: RiskLevel | null
+  reasons: string | null
+  basis_as_of: string | null
+  policy_version: number | null
+}
+
 export interface PlanItem {
   id: string
   table_id: string
@@ -230,6 +243,56 @@ export interface PlanItem {
   risk: RiskLevel
   reasons: string
   status: string
+  previous: PlanItemPrevious | null
+}
+
+export type BasisState = 'fresh' | 'stale' | 'frozen' | 'unknown'
+
+export interface PlanPreviousSnapshot {
+  fingerprint: string | null
+  policy_version: number
+  basis_as_of: string | null
+  captured_at: string | null
+  rechecked_at: string | null
+  summary: {
+    item_count: number
+    total_size_gb: number
+    save_month: number
+    save_year: number
+    migration_cost: number
+    net_save_year: number
+    avg_payback: number | null
+    risk_block_count: number
+    risk_warn_count: number
+  }
+  items: Array<{
+    table_id: string
+    table_name: string
+    size_gb: number
+    hot_score: number
+    save_month: number
+    migration_cost: number
+    payback_months: number | null
+    net_save_year: number
+    risk: RiskLevel
+    reasons: string
+    policy_version: number
+    basis_as_of: string | null
+  }>
+}
+
+export interface PlanBasis {
+  state: BasisState
+  is_stale: boolean
+  reasons: string[]
+  drift: boolean
+  as_of: string | null
+  fingerprint: string | null
+  policy_version: number | null
+  captured_at: string | null
+  current_policy_version: number | null
+  current_as_of: string | null
+  previous: PlanPreviousSnapshot | null
 }
 
 export interface Plan {
@@ -255,4 +318,7 @@ export interface Plan {
   note: string
   item_count: number
   items: PlanItem[]
+  basis: PlanBasis
+  allow_submit: boolean
+  allow_export: boolean
 }

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import ForeignKey, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -36,4 +36,15 @@ class MigrationPlanItem(Base, TimestampMixin):
     net_save_year: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     risk: Mapped[str] = mapped_column(String(10), nullable=False, default="ok")
     reasons: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # 上次测算结果（复检 / 追加 / 移除前保留，供页面对比；首次测算时为 None）
+    prev_size_gb: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    prev_hot_score: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    prev_save_month: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    prev_migration_cost: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    prev_payback_months: Mapped[float | None] = mapped_column(Numeric(8, 2), nullable=True)
+    prev_net_save_year: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    prev_risk: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    prev_reasons: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prev_basis_as_of: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    prev_policy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(12), nullable=False, default="pending", index=True)

@@ -29,7 +29,7 @@ from src.models.migration_plan_item import MigrationPlanItem
 from src.models.table_profile import TableProfile
 from src.models.tier_policy import TierPolicy
 from src.models.user import User
-from src.services import heat_service, plan_service, policy_service
+from src.services import basis_service, heat_service, plan_service, policy_service
 from src.utils.password import hash_password
 from scripts import fixtures
 
@@ -195,6 +195,10 @@ def seed_plan(db) -> None:
         select(MigrationPlan).where(MigrationPlan.code == fixtures.SEED_PLAN_CODE)
     ).scalar_one_or_none()
     if existing is not None:
+        # 幂等重跑：补齐历史计划（老 volume 升级上来）缺失的测算依据，不改动结果
+        if not existing.basis_fingerprint:
+            group = policy_service.load_current(db)
+            basis_service.capture(db, existing, group, date.today())
         _skipped("MigrationPlan", fixtures.SEED_PLAN_CODE)
         return
 

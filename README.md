@@ -12,7 +12,7 @@
 | 上游 | 表元数据（大小 / 分区 / 压缩 / 最近写入）+ 按天聚合的查询日志（本仓库 seed 生成 3,600 行日访问） |
 | 本系统替代 | 「凭印象挑表 + Excel 估省」→「热度口径统一 + 净收益测算 + 风险闸门 + 工单导出」 |
 | 下游 | 季度存储预算评审（财务）、迁移工单（平台组执行）、报表 owner 的确认回执 |
-| 一天的工作剧本 | 09:10 陈可欣（admin）在「策略与试算」确认本季单价 热 1.05 / 温 0.85 / 冷 0.55 ¥/GB·月；09:35 林哲（analyst）把阈值调到 20 试算，命中 12 张，预估月省 ¥6,840；10:05 勾选前 8 张建计划 `MP-2026Q4-00x`；10:20 风险复检，`ads.monthly_finance_report_base`、`dws.store_daily_gmv` 近 7 天仍被访问 → 阻断；10:32 逐张移除阻断项；10:40 提交 6 张，净年省 ¥51,300、平均回收期 1.8 月；10:45 导出工单 CSV 交平台组排期；11:00 赵敏（viewer）在只读视图核对收益与风险。 |
+| 一天的工作剧本 | 09:10 陈可欣（admin）在「策略与试算」确认本季单价 热 1.05 / 温 0.85 / 冷 0.55 ¥/GB·月；09:35 林哲（analyst）把阈值调到 20 试算，命中 12 张，预估月省 ¥6,840；10:05 勾选前 8 张建计划 `MP-2026Q4-00x`（计划记录当时测算依据）；10:20 风险复检，`ads.monthly_finance_report_base`、`dws.store_daily_gmv` 近 7 天仍被访问 → 阻断；10:32 逐张移除阻断项；10:40 提交 6 张，净年省 ¥51,300、平均回收期 1.8 月，提交时口径冻结；10:45 导出工单 CSV 交平台组排期；11:00 赵敏（viewer）在只读视图核对收益与风险；次日 admin 调价或补录查询日志后，任何未提交草稿自动标「依据失效」并锁定提交/导出，复检后按新依据整体刷新且保留上次结果对比。 |
 
 ## 2. 角色与权限（后端 RBAC 真实返回 403）
 
@@ -30,7 +30,7 @@
 2. **存储概览**（`/overview`）：三档货架（体积 / 单价 / 月成本）、分层 × 温区体积树图（squarified，自绘 SVG）、42 张表货架清单（温区/分层/搜索/排序）、候选温度计、最热表与最大降冷机会、审计尾行。
 3. **表热度详情**（`/tables/:id`）：90 天访问序列 + 衰减权重图（自绘 SVG）、温度计、风险闸门逐项结论、收益测算、表元数据、同层邻表。
 4. **策略与试算**（`/policies`）：阈值滑杆 + 试算（命中数 / 月省 / 年省 / 净年省 / 回收期）、逐表勾选、以选中项建计划；admin 可编辑三档单价与冷区前置条件（保存即升版 v+1，旧版归档）。
-5. **迁移计划**（`/plans`）：计划台账（左）+ 计划工位（右）：风险复检 → 移除阻断项 → 提交 → 导出工单 CSV；admin 额外可见审计台账。
+5. **迁移计划**（`/plans`）：计划台账（左）+ 计划工位（右）：风险复检 → 移除阻断项 → 提交 → 导出工单 CSV；admin 额外可见审计台账。计划记录「测算依据」，依据失效时页面标红并锁定提交/导出，复检后按最新依据整体刷新逐表结果并保留上次结果对比；已提交计划口径冻结，后续数据变化不改写历史工单。
 
 实体贯穿：`TableProfile` / `AccessStat` / `TierPolicy` / `MigrationPlan`（含子聚合 `MigrationPlanItem`）
 表 → `backend/src/models/*` → `schemas/*` → `services/*` → `controllers/*` + `routes/*` → 前端 `api/*` → `stores/*` → `pages` + `components/domain/*`。
@@ -66,6 +66,20 @@ net_save_year = save_month × 12 − migration_cost            # 首年净省
 复现条件：seed 固定 42 张表与 3,600 行日访问（确定性哈希抖动），阈值 20 时结果恒为
 `命中 12 张 / 月省 6840 / 年省 82080`；勾选前 8 张并移除 2 张阻断项后
 `6 张 / 净年省 51300 / 平均回收期 1.8 月 / 工单 CSV 6 行`。
+
+**测算依据（basis）与失效闸门**（`backend/src/services/basis_service.py` + `basis_core.py`）
+
+```
+basis = { as_of, policy(版本+单价+闸门), heat(窗口/半衰期/加成), access(日志摘要), profiles(档案摘要) }
+fingerprint = sha256(canonical_json(basis))
+草稿计划：fingerprint ≠ 当前 basis  -> stale：页面标「依据失效」，提交/导出返回 409 PLAN_BASIS_STALE
+复检     ：按当前 basis 整表重算收益与风险，旧结果整份写入 previous（逐表 prev_* + 计划头快照）
+提交     ：固化当时 basis（frozen）；之后策略/访问变化只提示 drift，不改写已提交计划的工单口径
+```
+
+任何一项依据变化都会让草稿失效：季度调价（策略升版或改单价/闸门参数）、查询日志补录
+（窗口内新增 / 修改 access_stats 行）、表档案变化（体积 / 分区 / 报表引用）、测算日期跨天
+（90 天窗口右端点前移）。失效原因以人话列在页面横幅里（如「策略版本 v3 → v4」「访问日志已变化（含回溯补录）」）。
 
 ## 5. 快速启动
 
@@ -127,7 +141,7 @@ gb-582/
 ├── .env / .env.example
 ├── backend/
 │   ├── Dockerfile  entrypoint.sh  requirements.txt  alembic.ini
-│   ├── migrations/             # env.py + versions/0001_initial.py
+│   ├── migrations/             # env.py + versions/0001_initial.py + 0002_plan_basis.py（计划依据与上次结果）
 │   ├── scripts/                # bootstrap_db.py / fixtures.py / seed_demo.py
 │   └── src/
 │       ├── config/             # settings / database / celery_app / app(create_app)
@@ -135,6 +149,7 @@ gb-582/
 │       ├── models/             # table_profile / access_stat / tier_policy / migration_plan(+item) / audit_log / user
 │       ├── schemas/            # common / auth / table / policy / plan / overview
 │       ├── services/           # heat_service(算法1) / cost_service(算法2) / trial / plan / policy / table / overview / export / audit / auth
+│       │                       # + basis_core(指纹/差异纯函数) / basis_service(依据抓取·失效判定·冻结)
 │       ├── controllers/        # health / auth / overview / table / policy / plan / audit
 │       ├── routes/             # 统一 /api 前缀
 │       ├── middlewares/        # auth(JWT) / rbac(403) / rate_limit(Redis) / audit_logger / error_handler
@@ -192,12 +207,17 @@ gb-582/
 
 | 端 | 位置 |
 |---|---|
-| 后端 | `src/constants/enums.py`(RiskLevel, RISK_LABELS) · `services/cost_service.py`(assess_risk) · `services/plan_service.py` · `services/trial_service.py` · `services/export_service.py` · `models/migration_plan_item.py`(risk) · `schemas/table.py`(risk) · `schemas/policy.py`(risk) · `schemas/plan.py`(risk/risk_block_count/risk_warn_count) |
+| 后端 | `src/constants/enums.py`(RiskLevel, RISK_LABELS) · `services/cost_service.py`(assess_risk) · `services/plan_service.py` · `services/trial_service.py` · `services/export_service.py` · `models/migration_plan_item.py`(risk / prev_risk) · `schemas/table.py`(risk) · `schemas/policy.py`(risk) · `schemas/plan.py`(risk/risk_block_count/risk_warn_count) |
 | 前端 | `types/domain.ts`(RiskLevel) · `constants/enums.ts`(RISK_LEVELS / RISK_LABELS) · `components/common/RiskBadge.vue` · `components/domain/ShelfTable.vue` · `TrialBoard.vue` · `PlanWorkbench.vue` · `pages/TableHeatPage.vue` |
 
 **`dw_layer`（ods / dwd / dws / ads）**：`src/constants/enums.py`(DwLayer, LAYER_LABELS) · `models/table_profile.py` · `scripts/fixtures.py` · `schemas/overview.py`(LayerCell) · 前端 `types/domain.ts`(DwLayer) · `constants/enums.ts`(DW_LAYERS / LAYER_LABELS) · `hooks/useTableFilter.ts` · `components/domain/TreemapBoard.vue` · `ShelfTable.vue` · `pages/OverviewPage.vue` · `TableHeatPage.vue`
 
-**`plan_status`（draft / submitted / approved / cancelled）**：`src/constants/enums.py`(PlanStatus, PLAN_STATUS_LABELS) · `models/migration_plan.py`(status) · `services/plan_service.py` · 前端 `types/domain.ts`(PlanStatus) · `constants/enums.ts`(PLAN_STATUS_LABELS) · `components/domain/PlanWorkbench.vue` · `pages/MigrationPlanPage.vue`
+**`plan_status`（draft / submitted / approved / cancelled）+ `basis_state`（fresh / stale / frozen / unknown，仅出参）**
+
+| 端 | 位置 |
+|---|---|
+| 后端 | `src/constants/enums.py`(PlanStatus, PLAN_STATUS_LABELS) · `models/migration_plan.py`(status / basis_*) · `models/migration_plan_item.py`(prev_*) · `services/plan_service.py` · `services/basis_service.py`(freshness) · `services/export_service.py` · `constants/error_codes.py`(PLAN_BASIS_STALE) · `schemas/plan.py`(PlanBasisOut) |
+| 前端 | `types/domain.ts`(PlanStatus / BasisState / PlanBasis / PlanPreviousSnapshot) · `constants/enums.ts`(PLAN_STATUS_LABELS) · `components/domain/PlanWorkbench.vue` · `pages/MigrationPlanPage.vue` · `stores/planStore.ts` |
 
 **`compression`（zstd / lz4 / snappy / none）**：`src/constants/enums.py`(Compression) · `models/table_profile.py` · `scripts/fixtures.py` · 前端 `constants/enums.ts`(COMPRESSION_LABELS) · `pages/TableHeatPage.vue` · `components/domain/ShelfTable.vue`
 

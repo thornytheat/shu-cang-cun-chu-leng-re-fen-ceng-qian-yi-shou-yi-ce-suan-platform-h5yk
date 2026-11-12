@@ -5,10 +5,16 @@
   migration_cost = Σ (size × 迁移单价 + 每表固定工单成本)
   net_save_year = save_year - migration_cost
   avg_payback = migration_cost / save_month（加权，1.8 月即此口径）
+
+测算依据（basis，见 basis_service）：
+  - 建计划 / 追加 / 复检时记录当时生效的策略、热度口径、访问日志摘要、表档案与 as_of；
+  - 草稿计划的依据与当前不一致 -> stale：页面标失效，提交与导出返回 409；
+  - 复检按最新依据整体更新逐表收益与风险，旧结果写入 previous_* 供页面对比；
+  - 提交时固化依据（frozen），之后数据变化不再改写已提交计划的历史工单口径。
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -28,7 +34,7 @@ from src.models.migration_plan import MigrationPlan
 from src.models.migration_plan_item import MigrationPlanItem
 from src.models.table_profile import TableProfile
 from src.models.user import User
-from src.services import audit_service, cost_service, heat_service, savings_core
+from src.services import audit_service, basis_service, cost_service, heat_service, savings_core
 from src.utils.errors import AppError, not_found
 from src.utils.ids import parse_uuid
 
@@ -92,7 +98,7 @@ def recount(db: Session, plan: MigrationPlan) -> dict:
 
 
 def serialize_item(item: MigrationPlanItem) -> dict:
-    return {
+    payload = {
         "id": str(item.id),
         "table_id": str(item.table_id),
         "table_name": item.table_name,
@@ -107,11 +113,75 @@ def serialize_item(item: MigrationPlanItem) -> dict:
         "risk": item.risk,
         "reasons": item.reasons,
         "status": item.status,
+        "previous": None,
+    }
+    if item.prev_basis_as_of is not None or item.prev_save_month is not None:
+        payload["previous"] = {
+            "size_gb": float(item.prev_size_gb) if item.prev_size_gb is not None else None,
+            "hot_score": float(item.prev_hot_score) if item.prev_hot_score is not None else None,
+            "save_month": float(item.prev_save_month) if item.prev_save_month is not None else None,
+            "migration_cost": (
+                float(item.prev_migration_cost) if item.prev_migration_cost is not None else None
+            ),
+            "payback_months": (
+                float(item.prev_payback_months) if item.prev_payback_months is not None else None
+            ),
+            "net_save_year": (
+                float(item.prev_net_save_year) if item.prev_net_save_year is not None else None
+            ),
+            "risk": item.prev_risk,
+            "reasons": item.prev_reasons,
+            "basis_as_of": item.prev_basis_as_of,
+            "policy_version": int(item.prev_policy_version) if item.prev_policy_version is not None else None,
+        }
+    return payload
+
+
+def _basis_payload(plan: MigrationPlan, basis: dict | None) -> dict:
+    """计划出参里的测算依据块：状态 + 失效原因 + 冻结口径 + 上次结果。"""
+    if basis is None:
+        return {
+            "state": "unknown",
+            "is_stale": False,
+            "reasons": [],
+            "drift": False,
+            "as_of": plan.basis_as_of,
+            "fingerprint": plan.basis_fingerprint,
+            "policy_version": int(plan.policy_version),
+            "captured_at": plan.basis_captured_at.isoformat() if plan.basis_captured_at else None,
+            "current_policy_version": None,
+            "previous": plan.previous_snapshot,
+        }
+    fresh = basis_service.freshness(plan, basis)
+    snapshot = plan.basis_snapshot or {}
+    return {
+        "state": fresh["state"],
+        "is_stale": fresh["is_stale"],
+        "reasons": fresh["reasons"],
+        "drift": fresh["drift"],
+        "as_of": plan.basis_as_of,
+        "fingerprint": plan.basis_fingerprint,
+        "policy_version": (
+            int(snapshot["policy"]["version"]) if snapshot.get("policy") else int(plan.policy_version)
+        ),
+        "captured_at": plan.basis_captured_at.isoformat() if plan.basis_captured_at else None,
+        "current_policy_version": int((basis.get("policy") or {}).get("version") or 0),
+        "current_as_of": basis.get("as_of"),
+        # 计划头保留的整份上次结果（汇总 + 逐表），复检后用于页面对比
+        "previous": plan.previous_snapshot,
     }
 
 
-def serialize_plan(db: Session, plan: MigrationPlan, with_items: bool = True) -> dict:
+def serialize_plan(
+    db: Session,
+    plan: MigrationPlan,
+    with_items: bool = True,
+    basis: dict | None = None,
+) -> dict:
     items = active_items(db, plan.id)
+    if basis is None and with_items:
+        basis = basis_service.current_basis(db)
+    stale = bool(basis and basis_service.freshness(plan, basis)["is_stale"])
     payload = {
         "id": str(plan.id),
         "code": plan.code,
@@ -135,13 +205,20 @@ def serialize_plan(db: Session, plan: MigrationPlan, with_items: bool = True) ->
         "note": plan.note,
         "item_count": len(items),
         "items": [serialize_item(item) for item in items] if with_items else [],
+        "basis": _basis_payload(plan, basis),
+        # 页面禁用按钮用：草稿 + 依据有效 + 无阻断项 才能提交；导出同样要求依据有效
+        "allow_submit": bool(
+            plan.status == PlanStatus.DRAFT and not stale and items and plan.risk_block_count == 0
+        ),
+        "allow_export": bool(items) and not stale,
     }
     return payload
 
 
 def list_plans(db: Session) -> dict:
     rows = db.execute(select(MigrationPlan).order_by(MigrationPlan.created_at.desc())).scalars().all()
-    items = [serialize_plan(db, plan, with_items=False) for plan in rows]
+    basis = basis_service.current_basis(db)
+    items = [serialize_plan(db, plan, with_items=False, basis=basis) for plan in rows]
     return {"items": items, "meta": {"total": len(items), "returned": len(items), "filters": {}}}
 
 
@@ -179,6 +256,74 @@ def build_item(db: Session, plan: MigrationPlan, profile: TableProfile, hot, gro
     )
 
 
+def _remember_item(item: MigrationPlanItem, plan: MigrationPlan) -> None:
+    """把当前逐表结果挪到 previous_*（复检前调用），供页面对比上次口径。"""
+    item.prev_size_gb = item.size_gb
+    item.prev_hot_score = item.hot_score
+    item.prev_save_month = item.save_month
+    item.prev_migration_cost = item.migration_cost
+    item.prev_payback_months = item.payback_months
+    item.prev_net_save_year = item.net_save_year
+    item.prev_risk = item.risk
+    item.prev_reasons = item.reasons
+    item.prev_basis_as_of = plan.basis_as_of
+    item.prev_policy_version = int(plan.policy_version)
+
+
+def _plan_snapshot(db: Session, plan: MigrationPlan) -> dict:
+    """上次结果快照：汇总 + 逐表，和 basis 指纹一起留存，供页面「对比上次」。"""
+    items = active_items(db, plan.id)
+    return {
+        "fingerprint": plan.basis_fingerprint,
+        "policy_version": int(plan.policy_version),
+        "basis_as_of": plan.basis_as_of,
+        "captured_at": plan.basis_captured_at.isoformat() if plan.basis_captured_at else None,
+        "rechecked_at": plan.rechecked_at.isoformat() if plan.rechecked_at else None,
+        "summary": {
+            "item_count": len(items),
+            "total_size_gb": float(plan.total_size_gb),
+            "save_month": float(plan.save_month),
+            "save_year": float(plan.save_year),
+            "migration_cost": float(plan.migration_cost),
+            "net_save_year": float(plan.net_save_year),
+            "avg_payback": float(plan.avg_payback) if plan.avg_payback is not None else None,
+            "risk_block_count": int(plan.risk_block_count),
+            "risk_warn_count": int(plan.risk_warn_count),
+        },
+        "items": [
+            {
+                "table_id": str(item.table_id),
+                "table_name": item.table_name,
+                "size_gb": float(item.size_gb),
+                "hot_score": float(item.hot_score),
+                "save_month": float(item.save_month),
+                "migration_cost": float(item.migration_cost),
+                "payback_months": (
+                    float(item.payback_months) if item.payback_months is not None else None
+                ),
+                "net_save_year": float(item.net_save_year),
+                "risk": item.risk,
+                "reasons": item.reasons,
+                "policy_version": int(plan.policy_version),
+                "basis_as_of": plan.basis_as_of,
+            }
+            for item in items
+        ],
+    }
+
+
+def _require_fresh(db: Session, plan: MigrationPlan, basis: dict, action: str) -> None:
+    """草稿计划的依据必须与当前一致，否则拒绝提交 / 导出（409）。"""
+    fresh = basis_service.freshness(plan, basis)
+    if fresh["is_stale"]:
+        raise AppError(
+            codes.PLAN_BASIS_STALE,
+            "测算依据已失效，请先风险复检后再" + action,
+            "；".join(fresh["reasons"]),
+            extra={"reasons": fresh["reasons"]},
+        )
+
+
 def create_plan(
     db: Session,
     group,
@@ -186,6 +331,7 @@ def create_plan(
     actor: User | None = None,
     trace_id: str = "",
     code: str | None = None,
+    as_of: date | None = None,
 ) -> dict:
     table_ids = [str(tid) for tid in payload.table_ids]
     try:
@@ -195,6 +341,8 @@ def create_plan(
             codes.VALIDATION_ERROR, f"单次最多 {MAX_PLAN_ITEMS} 张表", f"count={len(table_ids)}"
         ) from None
     now = _now()
+    # 热度窗口与依据快照必须用同一个 as_of，否则跨零点建计划会出现「算的是昨天、记的是今天」
+    as_of = as_of or date.today()
     plan = MigrationPlan(
         code=code or _next_code(db, now),
         title=payload.title,
@@ -207,7 +355,7 @@ def create_plan(
     db.add(plan)
     db.flush()
 
-    scores = heat_service.compute_scores(db, group)
+    scores = heat_service.compute_scores(db, group, as_of)
     added = 0
     for table_id in table_ids:
         profile_key = parse_uuid(table_id)
@@ -223,6 +371,7 @@ def create_plan(
         added += 1
     db.flush()
     summary = recount(db, plan)
+    basis = basis_service.capture(db, plan, group, as_of)
     if actor is not None:
         audit_service.record(
             db,
@@ -230,19 +379,37 @@ def create_plan(
             actor=actor,
             entity_type="MigrationPlan",
             entity_id=plan.code,
-            detail={"items": added, "threshold": float(payload.threshold), **summary},
+            detail={
+                "items": added,
+                "threshold": float(payload.threshold),
+                "basis_fingerprint": basis_service.fingerprint_of(basis),
+                "basis_as_of": basis["as_of"],
+                **summary,
+            },
             trace_id=trace_id,
         )
-    return serialize_plan(db, plan)
+    return serialize_plan(db, plan, basis=basis)
 
 
-def add_items(db: Session, group, plan_id: str, table_ids: list[str], actor: User, trace_id: str = "") -> dict:
+def add_items(
+    db: Session,
+    group,
+    plan_id: str,
+    table_ids: list[str],
+    actor: User,
+    trace_id: str = "",
+    as_of: date | None = None,
+) -> dict:
     plan = _plan_or_404(db, plan_id)
     if plan.status != PlanStatus.DRAFT:
         raise AppError(codes.PLAN_NOT_DRAFT, "只有草稿状态的计划可以添加表", f"status={plan.status}")
+    # 依据已失效时不允许追加：新表会用新口径，旧表仍是旧口径，混算没有意义
+    as_of = as_of or date.today()
+    basis = basis_service.current_basis(db, group, as_of)
+    _require_fresh(db, plan, basis, "追加表")
 
     existing = {str(item.table_id) for item in active_items(db, plan.id)}
-    scores = heat_service.compute_scores(db, group)
+    scores = heat_service.compute_scores(db, group, as_of)
     added = 0
     for table_id in table_ids:
         table_key = str(table_id)
@@ -260,16 +427,18 @@ def add_items(db: Session, group, plan_id: str, table_ids: list[str], actor: Use
         added += 1
     db.flush()
     summary = recount(db, plan)
+    if added and not plan.basis_fingerprint:
+        basis = basis_service.capture(db, plan, group, as_of)
     audit_service.record(
         db,
         action=ACTION_PLAN_ITEM_ADD,
         actor=actor,
         entity_type="MigrationPlan",
         entity_id=plan.code,
-        detail={"added": added, **summary},
+        detail={"added": added, "basis_fingerprint": plan.basis_fingerprint, **summary},
         trace_id=trace_id,
     )
-    return serialize_plan(db, plan)
+    return serialize_plan(db, plan, basis=basis)
 
 
 def remove_item(db: Session, plan_id: str, item_id: str, actor: User, trace_id: str = "") -> dict:
@@ -283,6 +452,7 @@ def remove_item(db: Session, plan_id: str, item_id: str, actor: User, trace_id: 
     item.status = PlanItemStatus.REMOVED
     db.flush()
     summary = recount(db, plan)
+    basis = basis_service.current_basis(db)
     audit_service.record(
         db,
         action=ACTION_PLAN_ITEM_REMOVE,
@@ -292,51 +462,81 @@ def remove_item(db: Session, plan_id: str, item_id: str, actor: User, trace_id: 
         detail={"removed": item.table_name, "risk": item.risk, **summary},
         trace_id=trace_id,
     )
-    return serialize_plan(db, plan)
+    return serialize_plan(db, plan, basis=basis)
 
 
-def recheck(db: Session, group, plan_id: str, actor: User, trace_id: str = "") -> dict:
-    """风险复检：按最新访问数据重算每张表的风险与收益，同步刷新汇总。"""
+def recheck(
+    db: Session,
+    group,
+    plan_id: str,
+    actor: User,
+    trace_id: str = "",
+    as_of: date | None = None,
+) -> dict:
+    """风险复检：按最新依据整体重算每张表的风险与收益，刷新汇总并记录新依据。
+
+    上次结果整份挪到 previous（计划头 previous_snapshot + 逐表 previous_*），
+    页面据此对比「复检前 vs 复检后」，而不是让旧省额混进新汇总。
+    """
     plan = _plan_or_404(db, plan_id)
-    scores = heat_service.compute_scores(db, group)
+    if plan.status != PlanStatus.DRAFT:
+        raise AppError(codes.PLAN_NOT_DRAFT, "只有草稿状态的计划可以复检", f"status={plan.status}")
+    as_of = as_of or date.today()
+    if plan.basis_fingerprint:
+        plan.previous_snapshot = _plan_snapshot(db, plan)
+        plan.previous_fingerprint = plan.basis_fingerprint
+        plan.previous_at = plan.basis_captured_at
+    scores = heat_service.compute_scores(db, group, as_of)
     for item in active_items(db, plan.id):
         profile = db.get(TableProfile, item.table_id)
         hot = scores.get(str(item.table_id))
         if profile is None or hot is None:
             continue
+        _remember_item(item, plan)
         econ = cost_service.economics(float(profile.size_gb), profile.tier, group)
         verdict = cost_service.assess_risk(profile, hot, group)
         item.size_gb = float(profile.size_gb)
         item.hot_score = hot.hot_score
         item.suggested_tier = hot.suggested_tier
+        item.from_tier = profile.tier
         item.save_month = econ.save_month
         item.migration_cost = econ.migration_cost
         item.payback_months = econ.payback_months
         item.net_save_year = econ.net_save_year
         item.risk = verdict.risk
         item.reasons = verdict.reasons
+    plan.policy_version = int(group.version)
     plan.rechecked_at = _now()
     db.flush()
     summary = recount(db, plan)
+    basis = basis_service.capture(db, plan, group, as_of)
     audit_service.record(
         db,
         action=ACTION_PLAN_RECHECK,
         actor=actor,
         entity_type="MigrationPlan",
         entity_id=plan.code,
-        detail={**summary},
+        detail={
+            "basis_fingerprint": basis_service.fingerprint_of(basis),
+            "basis_as_of": basis["as_of"],
+            "policy_version": int(group.version),
+            "previous_fingerprint": plan.previous_fingerprint,
+            **summary,
+        },
         trace_id=trace_id,
     )
-    return serialize_plan(db, plan)
+    return serialize_plan(db, plan, basis=basis)
 
 
-def submit(db: Session, plan_id: str, actor: User, trace_id: str = "") -> dict:
+def submit(db: Session, plan_id: str, actor: User, trace_id: str = "", as_of: date | None = None) -> dict:
     plan = _plan_or_404(db, plan_id)
     if plan.status != PlanStatus.DRAFT:
         raise AppError(codes.PLAN_NOT_DRAFT, "该计划已提交，不能重复提交", f"status={plan.status}")
     items = active_items(db, plan.id)
     if not items:
         raise AppError(codes.PLAN_EMPTY, "计划中没有可提交的表", f"plan={plan.code}")
+    basis = basis_service.current_basis(db, as_of=as_of)
+    _require_fresh(db, plan, basis, "提交")
     blockers = savings_core.blockers(items)
     if blockers:
         raise AppError(
@@ -351,6 +551,12 @@ def submit(db: Session, plan_id: str, actor: User, trace_id: str = "") -> dict:
     plan.status = PlanStatus.SUBMITTED
     plan.submitted_at = now
     plan.submitted_by = actor.email
+    # 冻结当时口径：补充一次快照（此时依据已与当前一致），供历史工单回查；
+    # 提交后不再复检，后续数据变化不改写本计划。
+    plan.basis_snapshot = basis
+    plan.basis_fingerprint = basis_service.fingerprint_of(basis)
+    plan.basis_as_of = basis["as_of"]
+    plan.basis_captured_at = _now()
     db.flush()
     summary = recount(db, plan)
     audit_service.record(
@@ -359,10 +565,15 @@ def submit(db: Session, plan_id: str, actor: User, trace_id: str = "") -> dict:
         actor=actor,
         entity_type="MigrationPlan",
         entity_id=plan.code,
-        detail={**summary},
+        detail={
+            "basis_fingerprint": plan.basis_fingerprint,
+            "basis_as_of": plan.basis_as_of,
+            **summary,
+        },
         trace_id=trace_id,
     )
-    return serialize_plan(db, plan)
+    # 提交后的响应仍用提交时的依据，保证「历史口径」不回读当前数据
+    return serialize_plan(db, plan, basis=plan.basis_snapshot)
 
 
 def record_export(db: Session, plan: MigrationPlan, actor: User, row_count: int, trace_id: str = "") -> None:
@@ -384,10 +595,18 @@ def load_plan(db: Session, plan_id: str) -> MigrationPlan:
 def summary_of(db: Session, plan_id: str) -> dict:
     plan = load_plan(db, plan_id)
     counts = recount(db, plan)
+    basis = basis_service.current_basis(db)
+    fresh = basis_service.freshness(plan, basis)
     return {
         "plan_id": str(plan.id),
         "status": plan.status,
         "rechecked_at": plan.rechecked_at.isoformat() if plan.rechecked_at else None,
+        "basis_state": fresh["state"],
+        "basis_is_stale": fresh["is_stale"],
+        "basis_reasons": fresh["reasons"],
+        "basis_as_of": plan.basis_as_of,
+        "basis_fingerprint": plan.basis_fingerprint,
+        "current_basis_fingerprint": basis_service.fingerprint_of(basis),
         **counts,
     }
 

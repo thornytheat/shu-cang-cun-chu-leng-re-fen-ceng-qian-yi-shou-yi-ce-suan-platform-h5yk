@@ -10,6 +10,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
   PLAN_NOT_DRAFT: '只有草稿状态的计划可以修改',
   PLAN_EMPTY: '计划中没有可提交的表',
   PLAN_HAS_BLOCKERS: '计划中仍有被阻断的表，请先移除',
+  PLAN_BASIS_STALE: '测算依据已失效，请先风险复检后再提交/导出',
   EXPORT_EMPTY: '没有可导出的计划项',
   THRESHOLD_INVALID: '阈值必须落在 0 到 100 之间',
   TRIAL_NO_HIT: '当前阈值下没有命中的表',

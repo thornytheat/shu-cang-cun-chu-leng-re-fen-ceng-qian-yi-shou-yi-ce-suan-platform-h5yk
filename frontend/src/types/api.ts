@@ -4,6 +4,7 @@ export interface ApiError {
   detail?: string
   traceId?: string | null
   status?: number
+  extra?: Record<string, unknown>
 }
 
 export interface PageMeta {

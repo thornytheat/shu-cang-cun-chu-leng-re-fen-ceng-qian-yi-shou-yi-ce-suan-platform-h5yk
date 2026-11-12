@@ -110,6 +110,12 @@ onMounted(loadAll)
           <span class="mono c-risk">
             阻断 {{ plan.risk_block_count }} · 需确认 {{ plan.risk_warn_count }} · 阈值 {{ plan.threshold }}
           </span>
+          <span
+            v-if="plan.basis.is_stale"
+            class="mono c-basis stale"
+            title="测算依据已失效，需风险复检后才能提交/导出"
+          >依据失效</span>
+          <span v-else-if="plan.basis.state === 'frozen'" class="mono c-basis frozen">口径已冻结</span>
         </button>
         <EmptyState
           v-if="!plans.list.length && !plans.loading"
@@ -249,6 +255,20 @@ onMounted(loadAll)
 }
 .c-risk {
   color: var(--slate-faint);
+}
+.c-basis {
+  align-self: flex-start;
+  margin-top: 2px;
+  font-size: 9.5px;
+  padding: 0 6px;
+  border: 1px solid currentColor;
+}
+.c-basis.stale {
+  color: var(--block);
+  background: var(--hot-wash);
+}
+.c-basis.frozen {
+  color: var(--wood-deep);
 }
 .card-empty {
   grid-column: 1 / -1;

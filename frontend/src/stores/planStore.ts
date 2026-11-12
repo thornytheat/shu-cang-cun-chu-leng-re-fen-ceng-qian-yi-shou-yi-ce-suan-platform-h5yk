@@ -108,9 +108,15 @@ export const usePlanStore = defineStore('plan', {
       this.busy = true
       this.error = ''
       try {
+        const previousNet = this.current.net_save_year
         this.current = await recheckPlan(this.current.id)
         const plan = this.current
-        this.notice = `风险复检完成：${plan.risk_block_count} 张阻断 / ${plan.risk_warn_count} 张需确认`
+        const delta = plan.net_save_year - previousNet
+        const deltaText =
+          Math.abs(delta) < 0.005
+            ? '净年省与上次一致'
+            : `净年省较上次${delta >= 0 ? '增加' : '减少'} ¥${Math.abs(delta).toLocaleString('zh-CN')}`
+        this.notice = `风险复检完成：${plan.risk_block_count} 张阻断 / ${plan.risk_warn_count} 张需确认；依据更新至 ${plan.basis.as_of ?? '—'}，${deltaText}`
         this.syncList()
       } catch (error) {
         this.error = (error as { message?: string }).message ?? '复检失败'
@@ -125,10 +131,17 @@ export const usePlanStore = defineStore('plan', {
       try {
         this.current = await submitPlan(this.current.id)
         const plan = this.current
-        this.notice = `已提交 ${plan.item_count} 张，净年省 ¥${plan.net_save_year.toLocaleString('zh-CN')}`
+        this.notice = `已提交 ${plan.item_count} 张，净年省 ¥${plan.net_save_year.toLocaleString('zh-CN')}（口径冻结于 ${plan.basis.as_of ?? '—'}）`
         this.syncList()
       } catch (error) {
-        this.error = (error as { message?: string }).message ?? '提交失败'
+        const err = error as { code?: string; message?: string }
+        if (err.code === 'PLAN_BASIS_STALE' && this.current) {
+          // 后端拒绝：前端立即重拉，把依据失效状态显示到工位上
+          this.error = err.message ?? '测算依据已失效，请先风险复检'
+          await this.refreshCurrent()
+        } else {
+          this.error = err.message ?? '提交失败'
+        }
       } finally {
         this.busy = false
       }
@@ -142,10 +155,25 @@ export const usePlanStore = defineStore('plan', {
         this.notice = `已导出工单 CSV：${result.rows} 行`
         return result
       } catch (error) {
-        this.error = (error as { message?: string }).message ?? '导出失败'
+        const err = error as { code?: string; message?: string }
+        if (err.code === 'PLAN_BASIS_STALE' && this.current) {
+          this.error = err.message ?? '测算依据已失效，请先风险复检'
+          await this.refreshCurrent()
+        } else {
+          this.error = err.message ?? '导出失败'
+        }
         return null
       } finally {
         this.busy = false
+      }
+    },
+    async refreshCurrent() {
+      if (!this.current) return
+      try {
+        this.current = await fetchPlan(this.current.id)
+        this.syncList()
+      } catch {
+        // 保留当前视图，错误已由外层展示
       }
     },
   },
